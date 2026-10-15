@@ -1,0 +1,183 @@
+name: fluidsynth
+title: FluidSynth
+summary: Renders MIDI files to WAV, FLAC or Ogg Vorbis with SoundFont 2, SoundFont 3 and DLS instruments, using the FluidSynth software synthesizer.
+homepage: https://www.fluidsynth.org/
+# FluidSynth is under the LGPL. Its lookup tables are computed at build time
+# with gcem (Apache-2.0), which is header-only. fluid_dls.cpp contains a
+# string formatting helper under CC0-1.0, and the Freeverb reverb is in the
+# public domain (LicenseRef-Public-Domain). readline (GPL-3.0-or-later) is not
+# linked.
+license: LGPL-2.1-or-later AND Apache-2.0 AND CC0-1.0 AND LicenseRef-Public-Domain
+source-release: true
+upstream:
+  source: github-release
+  repository: FluidSynth/fluidsynth
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 2.6.1
+  # The releases carry prebuilt binaries but no source tarball, and the tags
+  # are lightweight and unsigned, so the build clones the tag and checks that
+  # it is this commit.
+  git:
+    url: https://github.com/FluidSynth/fluidsynth.git
+    tag: v{version}
+    commit: 71e85b2ca6bf48641ba7e2261d8f2640ae473773
+  # FluidSynth takes gcem from a git submodule. This is GitHub's archive of
+  # the gcem tag; its files were compared with the archive of the same commit
+  # that FluidSynth's FindGCEM.cmake pins by hash. The build stops when the
+  # archive is not the commit that FluidSynth records for the submodule.
+  extra-artifacts:
+    gcem:
+      version: 1.18.0
+      url: https://github.com/kthohr/gcem/archive/refs/tags/v{version}.tar.gz
+      sha256: 8e71a9f5b62956da6c409dda44b483f98c4a98ae72184f3aa4659ae5b3462e61
+image:
+  entrypoint: [fluidsynth]
+  cmd: [--help]
+test:
+  - |
+    fluidsynth --version > version.txt
+    for line in "FluidSynth runtime version $VERSION" "FluidSynth executable version $VERSION"; do
+      grep -Fqx "$line" version.txt || { echo "expected: $line" >&2; cat version.txt >&2; exit 1; }
+    done
+  - |
+    # libsndfile writes the audio files. The file writer is the only audio
+    # driver: the image has no sound card or sound server support.
+    fluidsynth -T help > types.txt
+    for type in wav flac oga raw; do
+      grep -Fq "'$type'" types.txt || { echo "missing file type: $type" >&2; cat types.txt >&2; exit 1; }
+    done
+    if grep -Fq 'No libsndfile support' types.txt; then cat types.txt >&2; exit 1; fi
+    fluidsynth -a help > drivers.txt
+    printf '%s\n' '-a options (audio driver):' "   'file'" > drivers.want
+    cmp -s drivers.want drivers.txt || { cat drivers.txt >&2; exit 1; }
+  - |
+    # A SoundFont with one preset, "Square": a looped square wave of 48 16-bit
+    # points at 44.1 kHz with root key 69, then the 46 zero points that the
+    # format requires after each sample.
+    z() { head -c "$1" /dev/zero; }
+    {
+      printf 'RIFF\154\002\000\000sfbkLIST\060\000\000\000INFO'
+      printf 'ifil\004\000\000\000\002\000\001\000isng\010\000\000\000EMU8000\000'
+      printf 'INAM\010\000\000\000Square\000\000'
+      printf 'LIST\310\000\000\000sdtasmpl\274\000\000\000'
+      i=0
+      while [ "$i" -lt 48 ]; do
+        if [ $((i / 8 % 2)) -eq 0 ]; then printf '\000\040'; else printf '\000\340'; fi
+        i=$((i + 1))
+      done
+      z 92
+      printf 'LIST\130\001\000\000pdtaphdr\114\000\000\000Square'; z 32
+      printf 'EOP'; z 21; printf '\001\000'; z 12
+      printf 'pbag\010\000\000\000\000\000\000\000\001\000\000\000pmod\012\000\000\000'; z 10
+      printf 'pgen\010\000\000\000\051\000\000\000'; z 4
+      printf 'inst\054\000\000\000Square'; z 16; printf 'EOI'; z 17; printf '\001\000'
+      printf 'ibag\010\000\000\000\000\000\000\000\002\000\000\000imod\012\000\000\000'; z 10
+      printf 'igen\014\000\000\000\066\000\001\000\065\000\000\000'; z 4
+      printf 'shdr\134\000\000\000Square'; z 18
+      printf '\060\000\000\000\010\000\000\000\050\000\000\000\104\254\000\000\105\000\000\000\001\000'
+      printf 'EOS'; z 43
+    } > tiny.sf2
+    # One track at 96 ticks per quarter note and the default 120 bpm: key 69
+    # pressed at tick 0 and released at tick 192, one second later.
+    {
+      printf 'MThd\000\000\000\006\000\000\000\001\000\140'
+      printf 'MTrk\000\000\000\015\000\220\105\144\201\100\200\105\100\000\377\057\000'
+    } > song.mid
+    render() { fluidsynth -q -ni -r 44100 "$@" tiny.sf2 song.mid; }
+    render -T raw -E little -F out.raw 2> raw.log || { cat raw.log >&2; exit 1; }
+    # The note lasts one second, and FluidSynth keeps rendering for two more
+    # seconds after the last voice ends so that reverb can fade out. Three
+    # seconds of 16-bit stereo at 44.1 kHz are 529200 bytes.
+    size=$(wc -c < out.raw)
+    if [ "$size" -lt 529200 ] || [ "$size" -gt 582120 ] || [ $((size % 4)) -ne 0 ]; then
+      echo "out.raw has $size bytes, expected a little over 529200" >&2; cat raw.log >&2; exit 1
+    fi
+    head -c "$size" /dev/zero > silence.raw
+    if cmp -s silence.raw out.raw; then echo "out.raw is silent" >&2; exit 1; fi
+    # The WAV file holds the same samples after a 44-byte header.
+    render -F out.wav 2> wav.log || { cat wav.log >&2; exit 1; }
+    [ "$(head -c 4 out.wav)" = RIFF ] || { od -An -c -N 16 out.wav >&2; exit 1; }
+    [ "$(head -c 12 out.wav | tail -c 4)" = WAVE ] || { od -An -c -N 16 out.wav >&2; exit 1; }
+    [ "$(wc -c < out.wav)" -eq $((size + 44)) ] || { echo "out.wav has $(wc -c < out.wav) bytes" >&2; exit 1; }
+    tail -c "$size" out.wav | cmp -s - out.raw || { echo "the samples in out.wav differ from out.raw" >&2; exit 1; }
+    # The file type follows the extension, or -T. Ogg Vorbis is "oga".
+    render -F out.flac 2> flac.log || { cat flac.log >&2; exit 1; }
+    [ "$(head -c 4 out.flac)" = fLaC ] || { od -An -c -N 16 out.flac >&2; cat flac.log >&2; exit 1; }
+    render -T oga -F out.ogg 2> ogg.log || { cat ogg.log >&2; exit 1; }
+    [ "$(head -c 4 out.ogg)" = OggS ] || { od -An -c -N 16 out.ogg >&2; cat ogg.log >&2; exit 1; }
+  - |
+    # -F - writes the audio to stdout, here the same raw samples as out.raw.
+    fluidsynth -q -ni -r 44100 -T raw -E little -F - tiny.sf2 song.mid > stdout.raw 2> stdout.log \
+      || { cat stdout.log >&2; exit 1; }
+    cmp -s out.raw stdout.raw || { echo "the samples on stdout differ from out.raw" >&2; cat stdout.log >&2; exit 1; }
+    # A SoundFont that cannot be loaded stops the program with an error.
+    printf 'RIFF\004\000\000\000sfbk' > broken.sf2
+    if fluidsynth -q -ni -F broken.wav broken.sf2 song.mid > broken.log 2>&1; then
+      echo "fluidsynth accepted a broken SoundFont" >&2; cat broken.log >&2; exit 1
+    fi
+    grep -Fq 'Failed to load the SoundFont broken.sf2' broken.log || { cat broken.log >&2; exit 1; }
+examples:
+  - title: Render a MIDI file to WAV with a SoundFont from the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/fluidsynth -ni -F song.wav FluidR3_GM.sf2 song.mid
+  - title: Render to FLAC at 48 kHz with a higher gain
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/fluidsynth -ni -r 48000 -g 0.6 -F song.flac FluidR3_GM.sf2 song.mid
+  - title: Mount a SoundFont as the default one, read-only
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -v "$HOME/soundfonts/FluidR3_GM.sf2:/usr/local/share/soundfonts/default.sf2:ro" ghcr.io/randomcontainers/fluidsynth -ni -F song.wav song.mid
+  - title: Render a MIDI file to MP3 with FFmpeg (default image)
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/fluidsynth -c 'fluidsynth -q -ni -r 44100 -T raw -E little -F - FluidR3_GM.sf2 song.mid | ffmpeg -loglevel error -f s16le -ar 44100 -ac 2 -i - -b:a 192k song.mp3'
+combos:
+  - with: [ffmpeg]
+    default: true
+    base: ffmpeg
+    summary: FluidSynth with FFmpeg, for rendering MIDI files to MP3, Opus, AAC and the other formats that FFmpeg encodes.
+    test:
+      - |
+        z() { head -c "$1" /dev/zero; }
+        {
+          printf 'RIFF\154\002\000\000sfbkLIST\060\000\000\000INFO'
+          printf 'ifil\004\000\000\000\002\000\001\000isng\010\000\000\000EMU8000\000'
+          printf 'INAM\010\000\000\000Square\000\000'
+          printf 'LIST\310\000\000\000sdtasmpl\274\000\000\000'
+          i=0
+          while [ "$i" -lt 48 ]; do
+            if [ $((i / 8 % 2)) -eq 0 ]; then printf '\000\040'; else printf '\000\340'; fi
+            i=$((i + 1))
+          done
+          z 92
+          printf 'LIST\130\001\000\000pdtaphdr\114\000\000\000Square'; z 32
+          printf 'EOP'; z 21; printf '\001\000'; z 12
+          printf 'pbag\010\000\000\000\000\000\000\000\001\000\000\000pmod\012\000\000\000'; z 10
+          printf 'pgen\010\000\000\000\051\000\000\000'; z 4
+          printf 'inst\054\000\000\000Square'; z 16; printf 'EOI'; z 17; printf '\001\000'
+          printf 'ibag\010\000\000\000\000\000\000\000\002\000\000\000imod\012\000\000\000'; z 10
+          printf 'igen\014\000\000\000\066\000\001\000\065\000\000\000'; z 4
+          printf 'shdr\134\000\000\000Square'; z 18
+          printf '\060\000\000\000\010\000\000\000\050\000\000\000\104\254\000\000\105\000\000\000\001\000'
+          printf 'EOS'; z 43
+        } > tiny.sf2
+        {
+          printf 'MThd\000\000\000\006\000\000\000\001\000\140'
+          printf 'MTrk\000\000\000\015\000\220\105\144\201\100\200\105\100\000\377\057\000'
+        } > song.mid
+        # The same one-second note and two-second tail as in the package
+        # tests, piped to FFmpeg as raw samples and encoded as MP3, and
+        # written as WAV and encoded as Opus.
+        fluidsynth -q -ni -r 44100 -T raw -E little -F - tiny.sf2 song.mid 2> render.log \
+          | ffmpeg -hide_banner -loglevel error -y -f s16le -ar 44100 -ac 2 -i - -c:a libmp3lame -b:a 128k song.mp3 \
+          || { cat render.log >&2; exit 1; }
+        fluidsynth -q -ni -r 44100 -F song.wav tiny.sf2 song.mid 2> wav.log || { cat wav.log >&2; exit 1; }
+        ffmpeg -hide_banner -loglevel error -y -i song.wav -c:a libopus -b:a 96k song.opus
+        for codec in mp3 opus; do
+          f="song.$codec"
+          ffprobe -v error -show_entries stream=codec_name,channels -of csv=p=0 "$f" > "$f.stream"
+          [ "$(cat "$f.stream")" = "$codec,2" ] || { cat "$f.stream" >&2; exit 1; }
+          d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f")
+          awk -v d="$d" 'BEGIN { exit !(d + 0 > 2.95 && d + 0 < 3.4) }' \
+            || { echo "$f lasts $d seconds, expected about 3" >&2; exit 1; }
+        done
+        # The square wave survives the encoding: its peak is far above silence.
+        ffmpeg -hide_banner -nostats -i song.mp3 -af volumedetect -f null - 2> volume.log
+        peak=$(sed -n 's/.*max_volume: \(-*[0-9.]*\) dB.*/\1/p' volume.log)
+        awk -v p="$peak" 'BEGIN { exit !(p != "" && p + 0 > -60) }' || { cat volume.log >&2; exit 1; }
