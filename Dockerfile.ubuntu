@@ -1,0 +1,181 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      git \
+      libsndfile1-dev \
+      ninja-build \
+      pkgconf; \
+    rm -rf /var/lib/apt/lists/*
+
+# FluidSynth attaches prebuilt binaries to its releases but no source
+# tarball, and its release tags are lightweight and unsigned, so the tag is
+# cloned and must point to the commit pinned in package.yml. The submodules
+# are not cloned: gcem comes from the archive pinned in package.yml,
+# Signalsmith's limiter and reverb are left out because their build fetches
+# more repositories at moving tags, and test/manual only holds data for
+# upstream's manual regression tests.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v${VERSION}" \
+      https://github.com/FluidSynth/fluidsynth.git /src/fluidsynth; \
+    test "$(git -C /src/fluidsynth rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }
+
+# gcem computes FluidSynth's lookup tables at compile time. git archive
+# stores the commit in the header of the tarball, and that commit must be the
+# one FluidSynth records for its gcem submodule.
+ARG GCEM_VERSION
+ARG GCEM_SHA256
+ADD --checksum=sha256:${GCEM_SHA256} https://github.com/kthohr/gcem/archive/refs/tags/v${GCEM_VERSION}.tar.gz /src/gcem.tar.gz
+RUN gzip -dc /src/gcem.tar.gz > /tmp/gcem.tar; \
+    archived="$(git get-tar-commit-id < /tmp/gcem.tar)"; \
+    recorded="$(git -C /src/fluidsynth rev-parse HEAD:gcem)"; \
+    test "$archived" = "$recorded" \
+      || { echo "gcem ${GCEM_VERSION} is commit ${archived}, FluidSynth ${VERSION} records ${recorded}" >&2; exit 1; }; \
+    tar -xf /tmp/gcem.tar -C /src/fluidsynth/gcem --strip-components=1; \
+    test -f /src/fluidsynth/gcem/include/gcem.hpp; \
+    rm /tmp/gcem.tar
+
+# CMake leaves out a feature whose library it cannot find without stopping,
+# so the configuration is checked in config.h. Files are written through
+# libsndfile, and every audio and MIDI driver is off: the image has no sound
+# card. readline (GPL-3.0-or-later) is off, so the interactive shell reads
+# plain lines. The program finds its library in /usr/local/lib through its
+# RUNPATH. Upstream's unit tests run against the build.
+WORKDIR /src/fluidsynth
+ARG JOBS
+RUN cmake -S . -B /src/build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DCMAKE_INSTALL_RPATH=/usr/local/lib \
+      -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+      -Dosal=cpp11 \
+      -Denable-libsndfile=ON \
+      -Denable-aufile=ON \
+      -Denable-native-dls=ON \
+      -Denable-openmp=ON \
+      -Denable-alsa=OFF \
+      -Denable-dbus=OFF \
+      -Denable-jack=OFF \
+      -Denable-ladspa=OFF \
+      -Denable-midishare=OFF \
+      -Denable-oss=OFF \
+      -Denable-pipewire=OFF \
+      -Denable-portaudio=OFF \
+      -Denable-pulseaudio=OFF \
+      -Denable-readline=OFF \
+      -Denable-sdl3=OFF \
+      -Denable-signalsmith=OFF \
+      -Denable-systemd=OFF; \
+    config=/src/build/config.h; \
+    for feature in AUFILE_SUPPORT ENABLE_NATIVE_DLS HAVE_CXX_FILESYSTEM HAVE_OPENMP LIBSNDFILE_HASVORBIS LIBSNDFILE_SUPPORT NETWORK_SUPPORT; do \
+      grep -Eq "^#define ${feature} 1$" "$config" || { echo "${feature} is not set in config.h" >&2; exit 1; }; \
+    done; \
+    if grep -E '^#define (ALSA|DBUS|JACK|MIDISHARE|OSS|PIPEWIRE|PORTAUDIO|PULSE|READLINE|SDL3|SIGNALSMITH|SYSTEMD)_SUPPORT|^#define LADSPA' "$config"; then \
+      echo "a driver or library that should be off is on" >&2; exit 1; \
+    fi; \
+    grep -Fqx '#define DEFAULT_SOUNDFONT "/usr/local/share/soundfonts/default.sf2"' "$config" \
+      || { grep DEFAULT_SOUNDFONT "$config" >&2; exit 1; }; \
+    grep -Fqx 'GCEM_INCLUDE_DIR:PATH=/src/fluidsynth/gcem/include' /src/build/CMakeCache.txt \
+      || { grep GCEM /src/build/CMakeCache.txt >&2; echo "gcem was not taken from the pinned archive" >&2; exit 1; }; \
+    cmake --build /src/build --parallel "${JOBS:-$(nproc)}"; \
+    cmake --build /src/build --parallel "${JOBS:-$(nproc)}" --target check; \
+    DESTDIR=/out cmake --install /src/build --strip; \
+    rm -rf /out/usr/local/include /out/usr/local/lib/cmake /out/usr/local/lib/pkgconfig /out/usr/local/share/man; \
+    rm /out/usr/local/lib/libfluidsynth.so; \
+    readelf -d /out/usr/local/bin/fluidsynth > /tmp/dynamic; \
+    grep -Eq 'Library (runpath|rpath): \[/usr/local/lib\]' /tmp/dynamic \
+      || { cat /tmp/dynamic >&2; echo "fluidsynth has no RUNPATH /usr/local/lib" >&2; exit 1; }
+
+ARG BASE_IMAGE
+# gcem's NOTICE.txt goes with its license. NOTICES holds the public domain
+# notice of the Freeverb reverb and the origin of the CC0-1.0 string helper in
+# fluid_dls.cpp, cut from their source files. runtime-deps lists the packages
+# that own the libraries FluidSynth loads, minus the base image's packages,
+# plus the packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    meta=/out/usr/local/share/randomcontainers/fluidsynth; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE "$meta/licenses/LICENSE"; \
+    cp gcem/LICENSE "$meta/licenses/LICENSE.gcem"; \
+    cp gcem/NOTICE.txt "$meta/licenses/NOTICE.gcem"; \
+    { \
+      f=src/rvoice/fluid_rev_freeverb.cpp; \
+      awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /public domain/) { printf "%s", b; exit } }' "$f" > /tmp/notice; \
+      test -s /tmp/notice || { echo "no public domain notice in $f" >&2; exit 1; }; \
+      printf '%s:\n\n' "$f"; cat /tmp/notice; echo; \
+      f=src/sfloader/fluid_dls.cpp; \
+      awk '/^\/\/ original license: CC0 1\.0$/ { print prev; print; exit } { prev = $0 }' "$f" > /tmp/notice; \
+      test -s /tmp/notice || { echo "no CC0 notice in $f" >&2; exit 1; }; \
+      printf '%s:\n\n' "$f"; cat /tmp/notice; \
+    } > "$meta/licenses/NOTICES"; \
+    for f in "$meta"/licenses/*; do test -s "$f" || { echo "empty: $f" >&2; exit 1; }; done; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/FluidSynth/fluidsynth.git@${SOURCE_COMMIT}" \
+      "https://github.com/FluidSynth/fluidsynth/tree/${SOURCE_COMMIT}" \
+      "https://github.com/kthohr/gcem/archive/refs/tags/v${GCEM_VERSION}.tar.gz" \
+      "https://github.com/randomcontainers/fluidsynth/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    LD_LIBRARY_PATH=/out/usr/local/lib /out/usr/local/bin/fluidsynth --version > /tmp/fluidsynth-version; \
+    for line in "FluidSynth runtime version ${VERSION}" "FluidSynth executable version ${VERSION}"; do \
+      grep -Fqx "$line" /tmp/fluidsynth-version || { cat /tmp/fluidsynth-version >&2; exit 1; }; \
+    done; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(c++ --version | head -n 1)"; \
+      echo "cmake: $(cmake --version | head -n 1)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "gcem: ${GCEM_VERSION} ($(git rev-parse HEAD:gcem))"; \
+      grep -E '^(CMAKE_BUILD_TYPE|osal|enable-[a-z0-9-]+):' /src/build/CMakeCache.txt; \
+      grep -E '^#define [A-Z0-9_]+ ' /src/build/config.h | grep -E '_SUPPORT |HASVORBIS|NATIVE_DLS|OPENMP|DEFAULT_SOUNDFONT'; \
+      cat /tmp/fluidsynth-version; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f \( -perm -u+x -o -name '*.so*' \) -print0 \
+      | xargs -0 env LD_LIBRARY_PATH=/out/usr/local/lib ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    grep -Eq '^[[:space:]]+libfluidsynth\.so\.3 => /out/usr/local/lib/' /tmp/ldd \
+      || { cat /tmp/ldd >&2; echo "fluidsynth does not load the libfluidsynth built here" >&2; exit 1; }; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/out\// { print $3 }' /tmp/ldd | LC_ALL=C sort -u > /tmp/libs; \
+    for lib in libsndfile libgomp; do \
+      grep -q "/${lib}\.so\." /tmp/libs || { cat /tmp/ldd >&2; echo "FluidSynth does not load ${lib}" >&2; exit 1; }; \
+    done; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | LC_ALL=C sort -u | LC_ALL=C comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+COPY --link --from=build /out/usr/local/ /usr/local/
+RUN set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /usr/local/share/randomcontainers/fluidsynth/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    ldconfig; \
+    install -d -m 1777 /work /cache
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "fluidsynth"]
+CMD ["--help"]
