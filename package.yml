@@ -15,14 +15,14 @@ upstream:
   tag-pattern: '^v(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
-  version: 2.6.2
+  version: 2.6.3
   # The releases carry prebuilt binaries but no source tarball, and the tags
   # are lightweight and unsigned, so the build clones the tag and checks that
   # it is this commit.
   git:
     url: https://github.com/FluidSynth/fluidsynth.git
     tag: v{version}
-    commit: c3b244ddfd094489a5490beee013c621a504adf2
+    commit: cd8b576ae6d33b805378356e5b33ec9f9c5b2e1b
   # FluidSynth takes gcem from a git submodule. This is GitHub's archive of
   # the gcem tag; its files were compared with the archive of the same commit
   # that FluidSynth's FindGCEM.cmake pins by hash. The build stops when the
